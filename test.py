@@ -78,44 +78,38 @@ def load_and_align_data(image, image_size, margin, gpu_memory_fraction):
 
     # 读取图片 
     img = image
-
     # 获取图片的shape
     img_size = np.asarray(img.shape)[0:2]
-
     # 返回边界框数组 （参数分别是输入图片 脸部最小尺寸 三个网络 阈值 factor不清楚）
     bounding_boxes, _ = align.detect_face.detect_face(img, minsize, pnet, rnet, onet, threshold, factor)
   
-    nrof_faces = bounding_boxes.shape[0]#number of faces
-        #print('找到人脸数目为：{}'.format(nrof_faces))
-    
-    if nrof_faces==0:
+    if len(bounding_boxes) < 1:
         return 0,0,0
     else:    
-        dataset={}
-        position={}
-        for face_position in bounding_boxes:      
-            face_position=face_position.astype(int)    
+        crop=[]
+        det=bounding_boxes
 
-            print((int(face_position[0]), int( face_position[1]),int(face_position[2]),int(face_position[3])))
-            if face_position[0]>=0 and face_position[1]>=0:
-            #word_position.append((int(face_position[0]), int( face_position[1])))
+        det[:,0]=np.maximum(det[:,0], 0)
+        det[:,1]=np.maximum(det[:,1], 0)
+        det[:,2]=np.minimum(det[:,2], img_size[1])
+        det[:,3]=np.minimum(det[:,3], img_size[0])
+
+        # det[:,0]=np.maximum(det[:,0]-margin/2, 0)
+        # det[:,1]=np.maximum(det[:,1]-margin/2, 0)
+        # det[:,2]=np.minimum(det[:,2]+margin/2, img_size[1])
+        # det[:,3]=np.minimum(det[:,3]+margin/2, img_size[0])
+
+        det=det.astype(int)
+
+        for i in range(len(bounding_boxes)):
+            temp_crop=img[det[i,1]:det[i,3],det[i,0]:det[i,2],:]
+            aligned=misc.imresize(temp_crop, (image_size, image_size), interp='bilinear')
+            prewhitened = facenet.prewhiten(aligned)
+            crop.append(prewhitened)
+        crop_image=np.stack(crop)
             
-                cv2.rectangle(img, (face_position[0], 
-                                face_position[1]), 
-                            (face_position[2], face_position[3]), 
-                            (0, 255, 0), 2)
-                
-                crop=img[face_position[1]:face_position[3],face_position[0]:face_position[2],]
+        return det,crop_image,1
 
-                crop = cv2.resize(crop, (160, 160), interpolation=cv2.INTER_CUBIC )
-
-                data=crop.reshape(-1,160,160,3)
-                dataset=data
-                position=face_position
-            else:
-                return 0,0,0
-
-    return position,dataset,1
 
 with tf.Graph().as_default():
     with tf.Session() as sess:  
@@ -128,25 +122,23 @@ with tf.Graph().as_default():
         embeddings = tf.get_default_graph().get_tensor_by_name("embeddings:0")
         phase_train_placeholder = tf.get_default_graph().get_tensor_by_name("phase_train:0")
     
-        model = joblib.load('./align/knn_classifier.model')
+        model = joblib.load('./models/knn_classifier.model')
 
         
         #开启ip摄像头
         video="http://admin:admin@192.168.0.107:8081/"   #此处@后的ipv4 地址需要修改为自己的地址
         # 参数为0表示打开内置摄像头，参数是视频文件路径则打开视频
         capture =cv2.VideoCapture(video)
-
         cv2.namedWindow("camera",1)
-
         c=0
         num = 0
         frame_interval=3 # frame intervals  
-
         while True:
             ret, frame = capture.read()
             timeF = frame_interval
 
             # print(shape(frame))
+            detect_face=[]
 
             if(c%timeF == 0):
                 find_results=[]
@@ -156,38 +148,42 @@ with tf.Graph().as_default():
 
                 if gray.ndim == 2:
                     img = to_rgb(gray)
-
-                # cv2.imshow('',img)
-
-                position,images_me,j= load_and_align_data(img, 160, 44, 1.0)
-
+                det,crop_image,j= load_and_align_data(img, 160, 44, 1.0)
                 if j:
-                    feed_dict = { images_placeholder: images_me, phase_train_placeholder:False }
-                 
+                    feed_dict = { images_placeholder: crop_image, phase_train_placeholder:False }        
                     emb = sess.run(embeddings, feed_dict=feed_dict) 
+
+                    for xx in range(len(emb)):
+                        print(type(emb[xx,:]),emb[xx,:].shape)
+                        detect_face.append(emb[xx,:])
+                    detect_face=np.array(detect_face)
+                    detect_face=detect_face.reshape(-1,128)
                     print('facenet embedding模型建立完毕')
 
-                    
-                    emb1=emb.reshape(1,128)
-
-                    print(type(emb1))
-                    print(emb1.shape)
-
-                    predict = model.predict(emb1) 
-
+                    predict = model.predict(detect_face) 
                     print(predict)
-                    
-                    if predict==1:
-                        find_results.append('Handsome Zu')
-                    elif predict==2:
-                        find_results.append('others')
-                
-                    cv2.putText(frame,'detected:{}'.format(find_results), (50,100), 
-                            cv2.FONT_HERSHEY_COMPLEX_SMALL, 2, (255, 0 ,0), 
-                            thickness = 2, lineType = 2)
+                    result=[]
 
-                    cv2.rectangle(frame,(position[0],position[1]),(position[2],position[3]),(0, 255, 0), 2, 8, 0)#画矩形框
+                    for i in range(len(predict)):
+                        if predict[i]==0:
+                            result.append('windzu')
+                        elif predict[i]==100:
+                            result.append('unknown')
 
+                    # 绘制矩形框并标注文字
+                    for rec_position in range(len(det)):
+                        
+                        cv2.rectangle(frame,(det[rec_position,0],det[rec_position,1]),(det[rec_position,2],det[rec_position,3]),(0, 255, 0), 2, 8, 0)
+
+                        cv2.putText(
+                            frame,
+                        result[rec_position], 
+                        (det[rec_position,0],det[rec_position,1]),
+                        cv2.FONT_HERSHEY_COMPLEX_SMALL, 
+                        0.8, 
+                        (0, 0 ,255), 
+                        thickness = 2, 
+                        lineType = 2)
                 cv2.imshow('camera',frame)
         
             c+=1
